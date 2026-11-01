@@ -473,7 +473,7 @@ export function settleRoundImmune(base: Promise<void>, onSettle: () => void): Pr
 
 /** Numeric `content-length` of a response — undefined when the header is
  *  absent or not a plain digit run. An over-limit declaration lets
- *  getText/getImage reject/miss BEFORE reading the body, so a huge response
+ *  fetchPlainText/fetchPlainImage reject/miss BEFORE reading the body, so a huge response
  *  never enters RAM; the post-read byte checks stay the authority when the
  *  header is absent or lies. */
 function contentLengthOf(headers: Headers): number | undefined {
