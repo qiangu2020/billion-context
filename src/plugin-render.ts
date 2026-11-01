@@ -10,7 +10,10 @@
 // with NO resolvable row in the window skips its coverage (its rows stay
 // live-visible — the safe direction) instead of failing the whole render.
 import http from "node:http";
+import { relocateCompressCarriers } from "acp-kernel";
 import { coreToAnthropic, type BiliMessage } from "acp-kernel/wire";
+import { loadConfigFile, isMcpBiliCompress } from "./config.js";
+import { resolveCompressAtFoldPoint } from "./knobs.js";
 import { getStore } from "./persist.js";
 import { peekSession } from "./session.js";
 import { pluginAgentHeader } from "./plugin.js";
@@ -115,7 +118,7 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         anchors.push({ pos: pos === -1 ? viewRows.length : pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
     }
     anchors.sort((a, b) => a.pos - b.pos);
-    const merged: BiliMessage[] = [];
+    let merged: BiliMessage[] = [];
     let ai = 0;
     for (let i = 0; i < viewRows.length; i++) {
         while (ai < anchors.length && anchors[ai].pos === i) {
@@ -129,6 +132,14 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
     while (ai < anchors.length) {
         merged.push(anchors[ai].msg);
         ai++;
+    }
+    // Fold-point carrier relocation mirror (switch A): with the knob on, move
+    // still-visible compress pairs from their original slot to their fold point
+    // — the same view-only transform the kernel node applies on processTurn,
+    // so the rendered prefix and steady turns agree. S4 has no per-request
+    // strictness context, so move-only (no thinking clear here).
+    if (resolveCompressAtFoldPoint(process.env, loadConfigFile().compress?.compressAtFoldPoint)) {
+        merged = relocateCompressCarriers(merged as unknown as Parameters<typeof relocateCompressCarriers>[0], session.state, { isCompressTool: isMcpBiliCompress }) as unknown as BiliMessage[];
     }
 
     const system = loadSystem(sessionId);
