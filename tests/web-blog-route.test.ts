@@ -113,10 +113,10 @@ test("#/blog/<slug> renders that single article with a back link", async () => {
     const list = r.els.get("bl-list")!;
     assert.ok(list.innerHTML.includes("post-body") && (list.innerHTML.includes("<p>hi</p>") || list.innerHTML.includes("\u4f60\u597d</p>")), "article body rendered (locale-twin aware)");
     assert.ok(list.innerHTML.includes('<a href="#/blog" class="bl-back">'), "back link to the index present");
-    // #5396: the detail header also carries the GitHub comment-thread link —
-    // repo-scoped issue search on the post id (#5393 convention), new tab, noopener.
-    const issueHref = "https://github.com/ranxianglei/billion-context/issues?q=" + encodeURIComponent('is:issue in:title "demo"');
-    assert.ok(list.innerHTML.includes('href="' + issueHref + '" target="_blank" rel="noopener"'), "GitHub comment-thread link present for the post id");
+    // #5396: the detail header also carries the GitHub discussion-thread link —
+    // repo-scoped Discussions search on the post id (#5411 convention), new tab, noopener.
+    const discHref = "https://github.com/ranxianglei/billion-context/discussions?discussions_q=" + encodeURIComponent('is:open in:title "demo"');
+    assert.ok(list.innerHTML.includes('href="' + discHref + '" target="_blank" rel="noopener"'), "GitHub discussion-thread link present for the post id");
 });
 
 test("unknown slug degrades to a back link without a crash", async () => {
