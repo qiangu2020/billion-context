@@ -9,8 +9,15 @@
  *
  * Design constraints (mirror web/changelog.ts):
  * - read-only public API, NO credentials, no config key, no env var:
- *   api.github.com repo-contents listing + raw.githubusercontent.com files,
- *   rate-limited unauthenticated exactly like the changelog probe;
+ *   api.github.com repo-contents listing + every file body pulled through
+ *   the source fallback chain raw.githubusercontent.com → api.github.com
+ *   contents (bodies arrive base64-inline in the JSON) — both members are
+ *   FIRST-PARTY GitHub hosts; no third-party mirror joins the chain (owner
+ *   decision 2026-11-01: an independent CDN copy is not trusted as a blog
+ *   content source) — the two hosts are NOT equally reachable from every
+ *   network (mainland-China egress routinely reaches only one of them), so
+ *   a round succeeds whenever ANY chain member can serve; rate-limited
+ *   unauthenticated exactly like the changelog probe;
  * - fail soft: any network failure keeps the last good overlay (or the
  *   bundled floor before the first success) and only records an "offline"
  *   marker; nothing throws out of the HTTP layer — kickBlogRefresh is
@@ -176,20 +183,18 @@ async function runRound(): Promise<void> {
         downloadedBytes += n;
         if (downloadedBytes > MAX_TOTAL_DOWNLOAD_BYTES) throw new Error(`round downloads exceed ${MAX_TOTAL_DOWNLOAD_BYTES} bytes`);
     };
+    const chain: ChainState = { start: 0, used: new Set() };
     try {
-        // 1. Post listing via the contents API, then every .md body from the
-        //    raw host (the contents API base64-encodes bodies; raw is simpler
-        //    and avoids its size cap for big figures).
+        // 1. Post listing via the contents API, then every .md body through
+        //    the source fallback chain (raw host preferred — overseas
+        //    behavior unchanged; the contents API / jsDelivr stand in when
+        //    raw is unreachable from this network — see sourceChainFor).
         const listing = await getJsonList(`${GITHUB_CONTENTS_URL}/${POST_DIR}?ref=${BRANCH}`);
         const names = listing
             .filter((e) => e.type === "file" && typeof e.name === "string" && e.name.endsWith(".md"))
             .map((e) => e.name as string)
             .sort();
-        await fetchAllText(
-            names.map((n) => ({ rel: `${POST_DIR}/${n}`, url: `${GITHUB_RAW_BASE}/${BRANCH}/${POST_DIR}/${encodeURIComponent(n)}` })),
-            files,
-            account,
-        );
+        await fetchAllText(names.map((n) => ({ rel: `${POST_DIR}/${n}` })), files, chain, account);
         if (files.size === 0) throw new Error("no post files returned");
 
 
@@ -199,7 +204,7 @@ async function runRound(): Promise<void> {
         //    it by that key when assembling the article section.
         let entries: ArticleEntry[] = [];
         try {
-            const manifestText = await getText(`${GITHUB_RAW_BASE}/${BRANCH}/${MANIFEST_REL}`, account);
+            const manifestText = await getTextChain(MANIFEST_REL, chain, account);
             files.set(MANIFEST_REL, manifestText);
             const parsed = JSON.parse(manifestText) as { articles?: unknown };
             if (Array.isArray(parsed.articles)) entries = parsed.articles.filter(isArticleEntry);
@@ -212,7 +217,7 @@ async function runRound(): Promise<void> {
                 if (isSafeRelPath(rel) && !wanted.includes(rel) && !files.has(rel)) wanted.push(rel);
             }
         }
-        await fetchAllText(wanted.map((rel) => ({ rel, url: rawUrl(rel) })), files, account);
+        await fetchAllText(wanted.map((rel) => ({ rel })), files, chain, account);
 
         // 3. Images referenced by ANY downloaded markdown — collected BEFORE
         //    rendering so the download set and buildRemoteBlogPosts' drop
@@ -229,11 +234,11 @@ async function runRound(): Promise<void> {
         if (files.size + targetList.length > MAX_TOTAL_FILES) {
             throw new Error(`round file count exceeds ${MAX_TOTAL_FILES}`);
         }
-        await fetchAllBinary(targetList.map((rel) => ({ rel, url: rawUrl(rel) })), assets, account);
+        await fetchAllBinary(targetList.map((rel) => ({ rel })), assets, chain, account);
 
         registerRemoteBlogFeed({ items: buildRemoteBlogPosts(files, new Set(assets.keys())), assets });
         remoteSnapshotPresent = true; // successful round ⇒ ≥1 post registered
-        loggerLog("info", `[blog-refresh] GitHub master round ok: ${files.size} documents, ${assets.size} images`);
+        loggerLog("info", `[blog-refresh] GitHub master round ok: ${files.size} documents, ${assets.size} images (via ${[...chain.used].join("+")})`);
     } catch (e) {
         // Keep whatever good overlay exists; the marker tells the panel it is
         // showing the frozen bundle (or the previous master snapshot).
@@ -264,6 +269,29 @@ function rawUrl(rel: string): string {
     return `${GITHUB_RAW_BASE}/${BRANCH}/${rel.split("/").map(encodeURIComponent).join("/")}`;
 }
 
+type SourceName = "raw" | "github-api";
+/** Per-round memory of the fallback walk: once a file had to drop down to
+ *  source i (raw being dead from this network), later files in the SAME
+ *  round start at i instead of re-paying one full timeout on every dead
+ *  upper source; `used` records which members served, for the ok log line.
+ *  Deliberately per-round (not module-sticky): a flapped-back raw host is
+ *  retried from position 0 on the next hourly round. */
+interface ChainState { start: number; used: Set<SourceName> }
+
+/** Ordered fallback chain for ONE repo-relative file body. raw first
+ *  (byte-identical to the pre-chain behavior); the contents API second — its
+ *  JSON answer carries the file base64-inline, and GitHub omits bodies over
+ *  1 MiB there, which cannot bite us because MAX_TEXT_BYTES (512 KiB) caps
+ *  every legal text document below that. First-party hosts only (see module
+ *  header): a third-party mirror deliberately does not join the chain. */
+function sourceChainFor(rel: string): { name: SourceName; url: string }[] {
+    const enc = rel.split("/").map(encodeURIComponent).join("/");
+    return [
+        { name: "raw", url: rawUrl(rel) },
+        { name: "github-api", url: `${GITHUB_CONTENTS_URL}/${enc}?ref=${BRANCH}` },
+    ];
+}
+
 async function getJsonList(url: string): Promise<ContentsEntry[]> {
     const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
     try {
@@ -276,13 +304,13 @@ async function getJsonList(url: string): Promise<ContentsEntry[]> {
     }
 }
 
-/** Download + cap + utf8-decode ONE text document. Any HTTP error, oversize
- *  body or budget miss THROWS — the caller fails the whole round; a
- *  half-fetched tree must not render. */
-async function getText(url: string, account?: (bytes: number) => void): Promise<string> {
+/** Download + cap + utf8-decode ONE plain (octet-stream/text) document from
+ *  the raw source. Any HTTP error, oversize body or budget miss THROWS — the
+ *  caller treats it as "this source failed" and walks the chain. */
+async function fetchPlainText(url: string, account?: (bytes: number) => void): Promise<string> {
     const result = await fetchWithTimeout(url, ghHeaders(), FETCH_TIMEOUT_MS);
     try {
-        if (!result.response.ok) throw new Error(`raw GET ${url} → HTTP ${result.response.status}`);
+        if (!result.response.ok) throw new Error(`plain GET ${url} → HTTP ${result.response.status}`);
         const declared = contentLengthOf(result.response.headers);
         if (declared !== undefined && declared > MAX_TEXT_BYTES) {
             throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes (content-length ${declared}): ${url}`);
@@ -296,10 +324,58 @@ async function getText(url: string, account?: (bytes: number) => void): Promise<
     }
 }
 
-/** Download ONE image; 404/oversize are SILENT MISSES (return undefined), any
- *  other failure throws. The rendered feed drops references whose target did
- *  not make it into the assets map — identical to the bundled disk path. */
-async function getImage(url: string, account?: (bytes: number) => void): Promise<{ buf: Buffer; type: string } | undefined> {
+/** Fetch ONE text document from the contents-API source: the JSON entry
+ *  carries the body base64-inline. Throws on every failure class (incl.
+ *  the >1 MiB body omission, which surfaces as `content: null`). */
+async function fetchApiText(rel: string, account?: (bytes: number) => void): Promise<string> {
+    const url = `${GITHUB_CONTENTS_URL}/${rel.split("/").map(encodeURIComponent).join("/")}?ref=${BRANCH}`;
+    const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
+    try {
+        if (!result.response.ok) throw new Error(`contents GET ${url} → HTTP ${result.response.status}`);
+        const data = (await result.response.json()) as { content?: unknown; encoding?: unknown };
+        if (typeof data.content !== "string") {
+            throw new Error(`contents API omitted the body (>1 MiB cap): ${rel}`);
+        }
+        // Size gate BEFORE decoding: base64 inflates payloads by ~4/3.
+        if (Math.ceil(data.content.length * 3 / 4) > MAX_TEXT_BYTES) {
+            throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${rel}`);
+        }
+        const buf = Buffer.from(data.content, "base64");
+        if (buf.byteLength > MAX_TEXT_BYTES) throw new Error(`text document exceeds ${MAX_TEXT_BYTES} bytes: ${rel}`);
+        account?.(buf.byteLength);
+        return buf.toString("utf8");
+    } finally {
+        result.stopIdleTimer();
+    }
+}
+
+/** Text fetch through the fallback chain for ONE repo-relative path. Any
+ *  per-source failure (network, HTTP, oversize, omitted body) walks to the
+ *  next member; the round only fails when EVERY member fails, and then with
+ *  the last error — half-fetched trees never render. On success the walk
+ *  point advances so later files skip already-proven-dead sources. */
+async function getTextChain(rel: string, chain: ChainState, account?: (bytes: number) => void): Promise<string> {
+    const sources = sourceChainFor(rel);
+    let lastError: unknown = new Error(`all sources failed for ${rel}`);
+    for (let i = Math.min(chain.start, sources.length - 1); i < sources.length; i++) {
+        try {
+            const text = i === 1 ? await fetchApiText(rel, account)
+                : await fetchPlainText(sources[i].url, account);
+            chain.start = Math.max(chain.start, i);
+            chain.used.add(sources[i].name);
+            return text;
+        } catch (e) {
+            lastError = e; // walk to the next fallback source
+        }
+    }
+    throw lastError;
+}
+
+/** Download ONE image from a PLAIN source (raw/jsDelivr); 404/oversize are
+ *  SILENT MISSES (return undefined), any other failure throws. The rendered
+ *  feed drops references whose target did not make it into the assets map —
+ *  identical to the bundled disk path. */
+async function fetchPlainImage(url: string, account?: (bytes: number) => void): Promise<{ buf: Buffer; type: string } | undefined> {
     let ext = "";
     const dot = url.lastIndexOf(".");
     if (dot !== -1) ext = url.slice(dot).toLowerCase();
@@ -318,6 +394,61 @@ async function getImage(url: string, account?: (bytes: number) => void): Promise
     } finally {
         result.stopIdleTimer();
     }
+}
+
+/** ONE image from the contents-API source. The API omits bodies over 1 MiB
+ *  (`content: null`): that is treated as a MISS, not an error — with first-
+ *  party hosts only in the chain, a figure bigger than the API cap simply
+ *  drains the chain to a clean miss and its reference drops (same churn
+ *  discipline as a true 404). */
+async function fetchApiImage(rel: string, account?: (bytes: number) => void): Promise<{ buf: Buffer; type: string } | undefined> {
+    const ext = rel.slice(rel.lastIndexOf("."));
+    const type = ASSET_TYPES[ext.toLowerCase()];
+    if (type === undefined) return undefined;
+    const url = `${GITHUB_CONTENTS_URL}/${rel.split("/").map(encodeURIComponent).join("/")}?ref=${BRANCH}`;
+    const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
+    try {
+        if (result.response.status === 404) return undefined;
+        if (!result.response.ok) throw new Error(`contents image GET ${url} → HTTP ${result.response.status}`);
+        const data = (await result.response.json()) as { content?: unknown };
+        if (typeof data.content !== "string") return undefined; // >1 MiB omission → next source
+        if (Math.ceil(data.content.length * 3 / 4) > MAX_IMAGE_BYTES) return undefined;
+        const buf = Buffer.from(data.content, "base64");
+        if (buf.byteLength === 0 || buf.byteLength > MAX_IMAGE_BYTES) return undefined;
+        account?.(buf.byteLength);
+        return { buf, type };
+    } finally {
+        result.stopIdleTimer();
+    }
+}
+
+/** Image fetch through the fallback chain. Misses (true 404s / >1 MiB API
+ *  omissions) keep walking — a file absent on one host is absent nowhere we
+ *  look, and walking costs bounded calls; the chain exhausts to a MISS
+ *  (undefined) only when no source produced bytes. If the LAST attempt died
+ *  with a hard error AND no source yielded even a clean miss, that error is
+ *  re-thrown (old strictness: a broken download set fails the round rather
+ *  than silently painting holes). */
+async function getImageChain(rel: string, chain: ChainState, account?: (bytes: number) => void): Promise<{ buf: Buffer; type: string } | undefined> {
+    const sources = sourceChainFor(rel);
+    let lastHardError: unknown;
+    let sawCleanMiss = false;
+    for (let i = Math.min(chain.start, sources.length - 1); i < sources.length; i++) {
+        try {
+            const got = i === 1 ? await fetchApiImage(rel, account)
+                : await fetchPlainImage(sources[i].url, account);
+            if (got !== undefined) {
+                chain.start = Math.max(chain.start, i);
+                chain.used.add(sources[i].name);
+                return got;
+            }
+            sawCleanMiss = true;
+        } catch (e) {
+            lastHardError = e;
+        }
+    }
+    if (!sawCleanMiss && lastHardError !== undefined) throw lastHardError;
+    return undefined;
 }
 
 function ghHeaders(accept?: string): Record<string, string> {
@@ -360,13 +491,13 @@ async function mapPool<T>(items: T[], fn: (t: T) => Promise<void>): Promise<void
     await Promise.all(workers);
 }
 
-async function fetchAllText(targets: { rel: string; url: string }[], sink: TextFileMap, account?: (bytes: number) => void): Promise<void> {
-    await mapPool(targets, async (t) => { sink.set(t.rel, await getText(t.url, account)); });
+async function fetchAllText(targets: { rel: string }[], sink: TextFileMap, chain: ChainState, account?: (bytes: number) => void): Promise<void> {
+    await mapPool(targets, async (t) => { sink.set(t.rel, await getTextChain(t.rel, chain, account)); });
 }
 
-async function fetchAllBinary(targets: { rel: string; url: string }[], sink: BinaryAssetMap, account?: (bytes: number) => void): Promise<void> {
+async function fetchAllBinary(targets: { rel: string }[], sink: BinaryAssetMap, chain: ChainState, account?: (bytes: number) => void): Promise<void> {
     await mapPool(targets, async (t) => {
-        const got = await getImage(t.url, account);
+        const got = await getImageChain(t.rel, chain, account);
         if (got !== undefined) sink.set(t.rel, got);
     });
 }

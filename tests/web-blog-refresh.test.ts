@@ -6,8 +6,11 @@
  * round succeeds), fail-soft (offline marker + last-good/bundled content
  *  kept, nothing throws), TTL gating + single-flight coalescing, remote
  *  long-form article rendering from the manifest (+ malformed-manifest
- *  degrade), the pure resolveRepoRel escape classes, and collectImageTargets
- *  candidate sets.
+ *  degrade), the pure resolveRepoRel escape classes, collectImageTargets
+ *  candidate sets, and the first-party-only source fallback chain
+ *  (raw → contents-API base64): a dead raw host costs the round nothing,
+ *  both GitHub hosts down fails soft with the offline marker, no third-party
+ *  host is ever contacted, and a healthy raw path never touches the API.
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -179,6 +182,96 @@ test("first-ever round failing still serves the bundled floor with the marker", 
     const feed = getBlogFeed();
     assert.equal(feed.error, "offline");
     assert.deepEqual(feed.items.map((i) => i.id).sort(), ["demo", "old"]);
+});
+
+/* ---------------- source fallback chain (GFW-class egress splits) ------- */
+
+const GH_API_PREFIX = "https://api.github.com/repos/ranxianglei/billion-context/";
+const POSTS_REL = "website/blog/posts";
+const CHAIN_LISTING = JSON.stringify([
+    { name: "2026-10-08_demo.md", type: "file" },
+    { name: "2026-10-08_demo.zh.md", type: "file" },
+    { name: "2026-10-09_fresh.md", type: "file" },
+    { name: "figures", type: "dir" },
+]);
+const apiFileUrl = (rel: string): string =>
+    `${GH_API_PREFIX}contents/${rel.split("/").map(encodeURIComponent).join("/")}?ref=master`;
+/** Contents-API file answer with the body base64-inline (its real shape). */
+const b64 = (buf: Buffer): Response =>
+    new Response(JSON.stringify({ content: buf.toString("base64"), encoding: "base64" }), { status: 200, headers: { "content-type": "application/json" } });
+
+test("raw unreachable → the contents-API chain serves the whole round", async () => {
+    const DEMO = Buffer.from('---\ntitle: "Demo (api)"\ndate: "2026-10-08"\n---\n\napi body\n\n![r](figures/r.png)\n');
+    const ZH = Buffer.from('---\ntitle_zh: "演示（api）"\n---\n\n中文来自 API。\n');
+    const FRESH = Buffer.from("# Fresh\n\nvia api\n");
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(CHAIN_LISTING, { status: 200 });
+        if (url.startsWith("https://raw.githubusercontent.com/")) throw new Error("raw connect timeout");
+        if (url === apiFileUrl(`${POSTS_REL}/2026-10-08_demo.md`)) return b64(DEMO);
+        if (url === apiFileUrl(`${POSTS_REL}/2026-10-08_demo.zh.md`)) return b64(ZH);
+        if (url === apiFileUrl(`${POSTS_REL}/2026-10-09_fresh.md`)) return b64(FRESH);
+        if (url === apiFileUrl(`${POSTS_REL}/figures/r.png`)) return b64(REMOTE_PNG);
+        return new Response("nf", { status: 404 }); // manifest absent (walks to a clean miss), nothing else
+    };
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true);
+    const feed = getBlogFeed();
+    assert.equal(feed.error, undefined);
+    const byId = new Map(feed.items.map((i) => [i.id, i]));
+    assert.equal(byId.get("demo")?.title, "Demo (api)");
+    assert.equal(byId.get("demo")?.titleZh, "演示（api）");               // bilingual pair intact over the API path
+    assert.match(byId.get("fresh")?.html ?? "", /via api/);
+    assert.ok(getRemoteBlogAsset(`${POSTS_REL}/figures/r.png`));        // image served from base64 JSON
+    assert.ok(!hits.some((h) => !h.startsWith("https://raw.githubusercontent.com/") && !h.startsWith("https://api.github.com/")),
+        "first-party hosts only: no third-party host was ever contacted");
+});
+
+test("raw AND contents-API dead (rate-limited) → the round fails soft with the offline marker", async () => {
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(CHAIN_LISTING, { status: 200 }); // listing still reachable
+        if (url.startsWith("https://raw.githubusercontent.com/")) throw new Error("raw connect timeout");
+        if (url.startsWith(GH_API_PREFIX)) return new Response("rate limited", { status: 403 }); // file endpoints exhausted
+        return new Response("nf", { status: 404 });
+    };
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true); // resolves — nothing throws out
+    const feed = getBlogFeed();
+    assert.equal(feed.error, "offline");                                // marker rides the feed
+    assert.ok(!hits.some((h) => !h.startsWith("https://raw.githubusercontent.com/") && !h.startsWith("https://api.github.com/")));
+});
+
+test("healthy raw path never touches the API file endpoints (overseas unchanged)", async () => {
+    installGithubRouter();
+    await runBlogRefreshRound({ force: true });
+    // Every non-listing GitHub call in a fully-healthy round is a WALK of an
+    // absent file (the optional articles.json, the 404ing missing.png)
+    // draining to its clean misses — no real document or image ever leaves
+    // the raw host, and no host beyond the two first-party ones exists.
+    const allowedApi = new Set([
+        CONTENTS_URL,
+        apiFileUrl("website/articles.json"),
+        apiFileUrl(`${POSTS_REL}/figures/missing.png`),
+    ]);
+    assert.ok(hits.filter((h) => h.startsWith(GH_API_PREFIX)).every((h) => allowedApi.has(h)));
+});
+
+test("image omitted by the >1 MiB API cap drains the chain to a clean miss; universal 404s stay misses", async () => {
+    const FRESH = Buffer.from("# Fresh\n\n![big](figures/big.png)\n\n![gone](figures/gone.png)\n");
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]), { status: 200 });
+        if (url.startsWith("https://raw.githubusercontent.com/")) throw new Error("raw down");
+        if (url === apiFileUrl(`${POSTS_REL}/2026-10-09_fresh.md`)) return b64(FRESH);
+        if (url === apiFileUrl(`${POSTS_REL}/figures/big.png`)) {
+            return new Response(JSON.stringify({ content: null, encoding: "base64" }), { status: 200 }); // >1 MiB omission shape
+        }
+        return new Response("nf", { status: 404 }); // gone.png is absent everywhere; so is the manifest
+    };
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true);
+    assert.equal(getBlogFeed().error, undefined);
+    assert.equal(getRemoteBlogAsset(`${POSTS_REL}/figures/big.png`), undefined); // above the API cap ⇒ reference dropped
+    const fresh = getBlogFeed().items.find((i) => i.id === "fresh");
+    assert.doesNotMatch(fresh?.html ?? "", /big\.png/);
+    assert.doesNotMatch(fresh?.html ?? "", /gone\.png/);                 // absent-everywhere stays a dropped reference, not a failure
 });
 
 test("disabled state short-circuits rounds without network (test escape hatch)", async () => {
