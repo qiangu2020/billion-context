@@ -187,8 +187,8 @@ async function runRound(): Promise<void> {
     try {
         // 1. Post listing via the contents API, then every .md body through
         //    the source fallback chain (raw host preferred — overseas
-        //    behavior unchanged; the contents API / jsDelivr stand in when
-        //    raw is unreachable from this network — see sourceChainFor).
+        //    behavior unchanged; the contents API stands in when raw is
+        //    unreachable from this network — see sourceChainFor).
         const listing = await getJsonList(`${GITHUB_CONTENTS_URL}/${POST_DIR}?ref=${BRANCH}`);
         const names = listing
             .filter((e) => e.type === "file" && typeof e.name === "string" && e.name.endsWith(".md"))
@@ -371,7 +371,7 @@ async function getTextChain(rel: string, chain: ChainState, account?: (bytes: nu
     throw lastError;
 }
 
-/** Download ONE image from a PLAIN source (raw/jsDelivr); 404/oversize are
+/** Download ONE image from the PLAIN source (raw host); 404/oversize are
  *  SILENT MISSES (return undefined), any other failure throws. The rendered
  *  feed drops references whose target did not make it into the assets map —
  *  identical to the bundled disk path. */
