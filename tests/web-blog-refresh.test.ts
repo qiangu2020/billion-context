@@ -293,6 +293,39 @@ test("sticky walk start: once the API serves, later files stop re-paying the dea
     assert.ok(rawAttempts <= 4, `expected ≤4 raw attempts for 8 files, got ${rawAttempts}`);
 });
 
+test("manifest-recorded discussion number passes through to the feed item verbatim", async () => {
+    const DEMO = "---\ntitle: \"Demo (disc)\"\ndate: \"2026-10-08\"\n---\n\ndisc body\n";
+    const ZH = "---\ntitle_zh: \"演示（disc）\"\n---\n\n中文 disc 正文。\n";
+    const FRESH = "# Fresh no-thread\n\nno discussion here\n";
+    const MANIFEST = JSON.stringify({ articles: [
+        { file: "website/blog/posts/2026-10-08_demo.md", zh_file: "website/blog/posts/2026-10-08_demo.zh.md", slug: "demo", discussion: 77 },
+        { file: "website/blog/posts/2026-10-09_nofresh.md" },
+    ]});
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(JSON.stringify([
+            { name: "2026-10-08_demo.md", type: "file" },
+            { name: "2026-10-08_demo.zh.md", type: "file" },
+            { name: "2026-10-09_nofresh.md", type: "file" },
+        ]), { status: 200 });
+        if (url === rawUrl("website/blog/posts/2026-10-08_demo.md")) return new Response(DEMO, { status: 200 });
+        if (url === rawUrl("website/blog/posts/2026-10-08_demo.zh.md")) return new Response(ZH, { status: 200 });
+        if (url === rawUrl("website/blog/posts/2026-10-09_nofresh.md")) return new Response(FRESH, { status: 200 });
+        if (url === rawUrl("website/articles.json")) return new Response(MANIFEST, { status: 200 });
+        return new Response("nf", { status: 404 });
+    };
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true);
+    const feed = getBlogFeed();
+    const byId = new Map(feed.items.map((i) => [i.id, i]));
+    const demo = byId.get("demo");
+    assert.equal(demo?.kind, "article");
+    assert.equal(demo?.discussion, 77, "recorded number passes through untouched");
+    const wire = JSON.parse(JSON.stringify(demo)) as Record<string, unknown>; // what GET /__bili/blog actually sends
+    assert.equal(wire.discussion, 77, "field survives JSON serialization to the client");
+    const plain = byId.get("2026-10-09_nofresh"); // no slug ⇒ id keeps the filename stem
+    assert.equal(plain?.kind, "article");
+    assert.ok(!JSON.stringify(plain).includes("\"discussion\""), "unrecorded article serializes WITHOUT the key (client hides the button)");
+});
+
 test("disabled state short-circuits rounds without network (test escape hatch)", async () => {
     installGithubRouter();
     _setBlogRefreshDisabledForTest(true);

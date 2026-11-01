@@ -250,12 +250,15 @@ async function runRound(): Promise<void> {
 /* ------------------------- transport helpers ------------------------- */
 
 interface ContentsEntry { name?: unknown; type?: unknown }
-interface ArticleEntry { file: string; zh_file?: string; slug?: string; title?: string; title_zh?: string }
+interface ArticleEntry { file: string; zh_file?: string; slug?: string; title?: string; title_zh?: string; discussion?: number }
 
 function isArticleEntry(x: unknown): x is ArticleEntry {
     const e = x as Partial<ArticleEntry>;
     return typeof e.file === "string" && e.file.length > 0 && !e.file.includes("\0")
-        && (e.zh_file === undefined || typeof e.zh_file === "string");
+        && (e.zh_file === undefined || typeof e.zh_file === "string")
+        // Discussion number written back by the pipeline workflow — must be a
+        // real positive integer, never a string or fraction.
+        && (e.discussion === undefined || (typeof e.discussion === "number" && Number.isInteger(e.discussion) && e.discussion > 0));
 }
 
 /** Root-relative POSIX path without absolute/escape/odd-segment surprises —
