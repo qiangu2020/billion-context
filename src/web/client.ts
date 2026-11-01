@@ -990,7 +990,7 @@ function changelogCatOf(rawLine) {
             const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
             const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
             const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
-            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a>" + '<a class="bl-back" href="' + blogIssueUrl(item.id) + '" target="_blank" rel="noopener">' + escapeHtml(t("bl.comment")) + "</a></div>"
+            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + '<a class="bl-back" href="' + blogIssueUrl(item.id) + '" target="_blank" rel="noopener">' + escapeHtml(t("bl.comment")) + "</a></div>"
                 + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
                 + '<div class="card-b post-body">' + html + "</div></div>";
             return;
