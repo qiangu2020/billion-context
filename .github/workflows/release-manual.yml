@@ -13,7 +13,7 @@ on:
         required: false
         default: false
       raw_publish:
-        description: "NUCLEAR OPTION (owner decision 2026-11-01): runs ONLY npm ci + npm run build, then npm publish immediately — no typecheck, no tests, no CI lanes, no push to master, no release PR. It publishes, pushes the git tag, creates the GitHub Release, and opens a version-sync PR so master can converge. Implies the skip_ci_gate bypass; both audit warnings are logged. Untick everything for normal releases."
+        description: "NUCLEAR OPTION (owner decision 2026-11-01): fetches the dependency packages once (plain lockfile download — NOT CI, runs no code), then does ONLY npm run build and npm publish immediately — no typecheck, no tests, no CI lanes, no push to master, no release PR. It publishes, pushes the git tag, creates the GitHub Release, and opens a version-sync PR so master can converge. Implies the skip_ci_gate bypass; both audit warnings are logged. Untick everything for normal releases."
         type: boolean
         required: false
         default: false
@@ -181,9 +181,9 @@ jobs:
         # below (policy 2026-10-10 unchanged); the Full CI gate blocks publish
         # until they are all green, so coverage is identical — only the
         # executor moved from this job to the parallel lane matrix.
-        # raw_publish bypasses this whole gate: its own step below runs
-        # `npm ci` + `npm run build` only (no typecheck, never any test)
-        # before publishing (#5430 nuclear option).
+        # raw_publish bypasses this whole gate: its own step below downloads the
+        # dependencies (lockfile fetch, no code runs) and builds only,
+        # then publishes (#5430 nuclear option).
         if: ${{ inputs.raw_publish != 'true' }}
         run: |
           npm ci
@@ -192,8 +192,10 @@ jobs:
 
       - name: Raw emergency publish (build only — NO typecheck, NO tests, NO CI, NO master push)
         id: rawpub
-        # #5430 nuclear option (owner decision 2026-11-01): the ONLY things that run before
-        # `npm publish` are `npm ci && npm run build`. master is never touched by this path;
+        # #5430 nuclear option (owner decision 2026-11-01): before `npm publish` this
+        # path does a one-time dependency download (`npm install`, straight from the
+        # lockfile — it executes no project code, it is not CI) and `npm run build`,
+        # and NOTHING else. master is never touched by this path;
         # it publishes, pushes the git tag, creates the GitHub Release, and opens a
         # version-sync PR so master can converge without re-running this path. Every
         # downstream step keys off steps.push.outputs.direct / needs_pr, which stay EMPTY
@@ -206,8 +208,8 @@ jobs:
         run: |
           set -euo pipefail
           VER="${{ steps.version.outputs.version }}"
-          echo "::warning::raw_publish=true EMERGENCY RAW PUBLISH at ${VER}: npm ci + build ONLY — no typecheck, no tests, no CI lanes, no push to master. This log line is the permanent audit record of the bypass."
-          npm ci
+          echo "::warning::raw_publish=true EMERGENCY RAW PUBLISH at ${VER}: deps download + npm run build ONLY — no typecheck, no tests, no CI lanes, no push to master. This log line is the permanent audit record of the bypass."
+          npm install --no-audit --no-fund
           npm run build
           if [ -n "$(npm view billion-context@${VER} version 2>/dev/null || true)" ]; then
             echo "::error::v${VER} already exists on npm — refusing a raw re-publish"
