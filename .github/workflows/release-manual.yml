@@ -186,7 +186,6 @@ jobs:
         # then publishes (#5430 nuclear option).
         if: ${{ inputs.raw_publish != 'true' }}
         run: |
-          npm ci
           npm run typecheck
           npm run build
 
