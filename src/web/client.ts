@@ -956,10 +956,10 @@ function changelogCatOf(rawLine) {
             // keep the stale paint; the cache keeps its old timestamp, so the next visit retries
         }).then(function () { blogRefreshBusy = false; });
     }
-    // Per-post discussion thread: the thread number is data, not inference — the blog
-    // pipeline workflow creates one Discussion per post and records its number in
-    // articles.json, which the feed passes through as item.discussion. Exact direct link
-    // only; a post without a recorded number simply shows no button (no guessed search URL).
+    // Per-post discussion thread: the thread number is data, not inference — it reaches
+    // the client as item.discussion once the server-side passthrough lands (separate PR,
+    // see PR body) and the pipeline records a number for the post. Exact direct link only;
+    // a post without a recorded number simply shows no button (no guessed search URL).
     function blogDiscussionUrl(item) {
         return (typeof item.discussion === "number" && item.discussion > 0)
             ? "https://github.com/ranxianglei/billion-context/discussions/" + item.discussion
