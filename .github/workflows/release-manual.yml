@@ -12,6 +12,11 @@ on:
         type: boolean
         required: false
         default: false
+      raw_publish:
+        description: "NUCLEAR OPTION (owner decision 2026-11-01): runs ONLY npm ci + npm run build, then npm publish immediately — no typecheck, no tests, no CI lanes, no push to master, no release PR. It publishes, pushes the git tag, creates the GitHub Release, and opens a version-sync PR so master can converge. Implies the skip_ci_gate bypass; both audit warnings are logged. Untick everything for normal releases."
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: one-click-release
@@ -176,13 +181,96 @@ jobs:
         # below (policy 2026-10-10 unchanged); the Full CI gate blocks publish
         # until they are all green, so coverage is identical — only the
         # executor moved from this job to the parallel lane matrix.
+        # raw_publish bypasses this whole gate: its own step below runs
+        # `npm ci` + `npm run build` only (no typecheck, never any test)
+        # before publishing (#5430 nuclear option).
+        if: ${{ inputs.raw_publish != 'true' }}
         run: |
           npm ci
           npm run typecheck
           npm run build
 
+      - name: Raw emergency publish (build only — NO typecheck, NO tests, NO CI, NO master push)
+        id: rawpub
+        # #5430 nuclear option (owner decision 2026-11-01): the ONLY things that run before
+        # `npm publish` are `npm ci && npm run build`. master is never touched by this path;
+        # it publishes, pushes the git tag, creates the GitHub Release, and opens a
+        # version-sync PR so master can converge without re-running this path. Every
+        # downstream step keys off steps.push.outputs.direct / needs_pr, which stay EMPTY
+        # because the push step is skipped when raw_publish is ticked — so no dispatch,
+        # no wait, no release PR, no second publish can fire from this job.
+        if: inputs.raw_publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.version }}"
+          echo "::warning::raw_publish=true EMERGENCY RAW PUBLISH at ${VER}: npm ci + build ONLY — no typecheck, no tests, no CI lanes, no push to master. This log line is the permanent audit record of the bypass."
+          npm ci
+          npm run build
+          if [ -n "$(npm view billion-context@${VER} version 2>/dev/null || true)" ]; then
+            echo "::error::v${VER} already exists on npm — refusing a raw re-publish"
+            exit 1
+          fi
+          NPMTAG="latest"
+          PRERELEASE="false"
+          case "$VER" in *-*) NPMTAG="dev"; PRERELEASE="true";; esac
+          npm publish --tag "$NPMTAG" --access public
+          echo "::warning::RAW PUBLISHED v${VER} to npm (tag ${NPMTAG}) with zero typecheck/test/CI coverage. master is NOT updated yet."
+          # --- convergence bookkeeping (best effort; a failure here never un-publishes) ---
+          LAST_TAG="$(git describe --match 'v[0-9]*' --tags --abbrev=0 HEAD~1 2>/dev/null || true)"
+          if [ -n "$LAST_TAG" ]; then
+            NOTES="$(git log --no-merges --pretty='- %s' "${LAST_TAG}..HEAD~1")"
+          else
+            NOTES="(no prior release tag found)"
+          fi
+          git tag "v${VER}" && git push origin "v${VER}" \
+            || echo "::warning::git tag push failed — patch-lane derivation (bugfix-v* from latest tag) stays on the previous tag until fixed manually"
+          RELEASE_PAYLOAD="$(mktemp)"
+          VER="$VER" PRERELEASE="$PRERELEASE" NOTES="$NOTES" node -e '
+            const fs = require("fs");
+            fs.writeFileSync(process.argv[1], JSON.stringify({
+              tag_name: "v" + process.env.VER, name: "v" + process.env.VER,
+              prerelease: process.env.PRERELEASE === "true",
+              body: "\u{1F6A8} **RAW EMERGENCY PUBLISH** (one-click \u0060raw_publish\u0060 checkbox, #5430): published straight from the pre-flight build — no typecheck, no tests, no CI lanes ran, and master was not pushed.\n\n## Changes since previous tag\n" + (process.env.NOTES || "(no changes recorded)"),
+            }));' "$RELEASE_PAYLOAD"
+          curl -sS -f -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" -d @"$RELEASE_PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" >/dev/null \
+            || echo "::warning::GitHub Release creation failed (the npm publish itself succeeded)"
+          SYNC_BRANCH="emergency-sync-v${VER}-$(date +%Y%m%d%H%M%S)"
+          git push -q origin "HEAD:refs/heads/${SYNC_BRANCH}"
+          PR_PAYLOAD="$(mktemp)"
+          VER="$VER" SYNC_BRANCH="$SYNC_BRANCH" NOTES="$NOTES" node -e '
+            const fs = require("fs");
+            fs.writeFileSync(process.argv[1], JSON.stringify({
+              title: "chore: sync package.json to v" + process.env.VER + " after emergency raw publish (#5430)",
+              head: process.env.SYNC_BRANCH, base: "master",
+              body: "Emergency raw publish put v" + process.env.VER + " on npm WITHOUT touching master (one-click \u0060raw_publish\u0060 checkbox). This tiny PR converges master (version bump + changelog/manifests only) so the next one-click release passes the drift guard. Merging it runs the normal CI lanes like any other PR and triggers NO second publish: release.yml gates on the \u0060*_release-v*\u0060 branch shape plus a \u0060release vX\u0060 commit subject, and this branch/title matches neither.\n\n## What shipped\n" + (process.env.NOTES || "(no changes recorded)"),
+            }));' "$PR_PAYLOAD"
+          RESP_FILE="$(mktemp)"
+          HTTP_CODE=$(curl -sS -o "$RESP_FILE" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" \
+            -d @"$PR_PAYLOAD" "https://api.github.com/repos/${{ github.repository }}/pulls")
+          PR_URL=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).html_url||"")}catch(e){console.log("")}' "$RESP_FILE")
+          echo "::notice::Version-sync PR for master convergence opened (HTTP ${HTTP_CODE})${PR_URL:+: ${PR_URL}}"
+          {
+            echo "### :rotating_light: RAW EMERGENCY PUBLISH v${VER}" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Published to npm (tag ${NPMTAG}) straight from the pre-flight build — no typecheck/tests/CI ran" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Git tag v${VER} pushed; GitHub Release body carries the raw-publish banner" >> "$GITHUB_STEP_SUMMARY"
+            [ -n "$PR_URL" ] && echo "- Merge this version-sync PR to converge master: ${PR_URL}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Until then the next one-click release ABORTS on the drift guard (master behind npm) — by design" >> "$GITHUB_STEP_SUMMARY"
+          }
+          echo "done"
+
       - name: Commit and push to master
         id: push
+        # Skipped on the raw_publish path: that step already published and pushed
+        # the tag; leaving direct/needs_pr empty deactivates every downstream
+        # dispatch/wait/release-PR/publish step in this job.
+        if: ${{ inputs.raw_publish != 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TRAIN_NAME: ${{ steps.train.outputs.name }}
