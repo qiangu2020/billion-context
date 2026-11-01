@@ -199,6 +199,15 @@ The workflow then:
 5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`, and creates
    the GitHub Release with notes generated from `git log` since the last tag.
 
+**Emergency bypass (`skip_ci_gate`, owner decision 2026-11-01):** ticking the checkbox
+skips the full-CI dispatch AND wait on BOTH paths (direct push and fallback PR) — the
+run finishes right after the fast pre-flight instead of waiting up to 60 minutes for
+every lane at the publish sha. A loud `::warning::` line in the job log is the permanent
+audit record, and on the fallback path the auto-PR body is stamped with an EMERGENCY
+BYPASS banner so whoever merges knows the sha shipped without lane verification.
+Leave it UNTICKED for normal releases: an unticked run publishes exactly as before,
+a green release branch included.
+
 A successful one-click run does NOT double-trigger `release.yml`: its check only
 matches release-branch merges / date-prefixed commits, never a plain `release v{VERSION}`
 commit. The standard branch/PR flow above remains the canonical path for anything

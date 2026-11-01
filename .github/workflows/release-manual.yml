@@ -258,7 +258,7 @@ jobs:
           node scripts/release-ci-gate.mjs --dispatch
 
       - name: Acknowledge CI-gate bypass (emergency checkbox)
-        if: ${{ inputs.skip_ci_gate && steps.push.outputs.direct == 'true' }}
+        if: ${{ inputs.skip_ci_gate && (steps.push.outputs.direct == 'true' || steps.push.outputs.needs_pr == 'true') }}
         run: |
           echo "::warning::skip_ci_gate=true: publishing WITHOUT waiting for the full CI lanes at this sha. Only the pre-flight typecheck+build ran. This log line is the permanent audit record of the bypass."
 
@@ -280,7 +280,9 @@ jobs:
           node scripts/release-ci-gate.mjs --wait
 
       - name: Dispatch full CI on fallback branch
-        if: steps.push.outputs.needs_pr == 'true'
+        # #5430 emergency path: with skip_ci_gate ticked nothing is dispatched or
+        # awaited — the owner explicitly traded full-lane verification for speed.
+        if: steps.push.outputs.needs_pr == 'true' && !inputs.skip_ci_gate
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -390,6 +392,7 @@ jobs:
           PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
           TRAIN_NAME: ${{ steps.train.outputs.name }}
           RECONCILE: ${{ steps.reconcile.outputs.missing_md }}
+          SKIP_GATE: ${{ inputs.skip_ci_gate }}
         run: |
           VER="${{ steps.version.outputs.version }}"
           LINK="https://github.com/${{ github.repository }}/pull/new/${PR_BRANCH}"
@@ -406,9 +409,12 @@ jobs:
             const intro = process.env.TRAIN_NAME
               ? "Ship PR for the patch train (dual-lane release): merging publishes the PRE-MERGE head tree — the base tag plus exactly this train\u2019s fixes, none of master\u2019s unreleased work — via release-bugfix.yml."
               : "Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.";
+            const skipBanner = process.env.SKIP_GATE === "true"
+              ? "\u{1F6A8} **EMERGENCY BYPASS ACTIVE**: the one-click run that prepared this PR ticked `skip_ci_gate` — no full-CI lane was dispatched or awaited at this sha. Merging publishes code CI has not verified here; the audit warning lives in that run log.\n\n"
+              : "";
             const warn = process.env.RECONCILE ? process.env.RECONCILE + "\n" : "";
             const body = [
-              intro,
+              skipBanner + intro,
               "",
               warn,
               "## Changes since " + (process.env.LAST_TAG || "n/a"),
@@ -465,7 +471,9 @@ jobs:
           exit 0
 
       - name: Wait for full CI green on fallback branch (track head)
-        if: steps.push.outputs.needs_pr == 'true'
+        # Same guard as the dispatch step above: the emergency checkbox must not
+        # be silently ignored on the fallback path (v0.1.211 stuck here 2026-11-01).
+        if: steps.push.outputs.needs_pr == 'true' && !inputs.skip_ci_gate
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
