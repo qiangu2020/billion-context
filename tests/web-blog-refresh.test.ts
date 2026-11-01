@@ -274,6 +274,25 @@ test("image omitted by the >1 MiB API cap drains the chain to a clean miss; univ
     assert.doesNotMatch(fresh?.html ?? "", /gone\.png/);                 // absent-everywhere stays a dropped reference, not a failure
 });
 
+test("sticky walk start: once the API serves, later files stop re-paying the dead raw host", async () => {
+    const NAMES = Array.from({ length: 8 }, (_, i) => `2026-10-0${i + 1}_p${i}.md`);
+    let rawAttempts = 0;
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(JSON.stringify(NAMES.map((n) => ({ name: n, type: "file" }))), { status: 200 });
+        if (url.startsWith("https://raw.githubusercontent.com/")) { rawAttempts++; throw new Error("raw dead"); }
+        for (const n of NAMES) if (url === apiFileUrl(`${POSTS_REL}/${n}`)) return b64(Buffer.from(`# P${n}\n\nbody\n`));
+        return new Response("nf", { status: 404 }); // manifest absent ⇒ clean miss
+    };
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true);
+    const ids = new Set(getBlogFeed().items.map((i) => i.id));
+    for (let i = 0; i < 8; i++) assert.ok(ids.has(`p${i}`), `post p${i} missing from the feed`);
+    // All CONCURRENCY=4 workers pick their first file before any API success can
+    // land, so at most that first wave pays the dead raw host once each; every
+    // later file must start at the walk point the first success advanced it to.
+    assert.ok(rawAttempts <= 4, `expected ≤4 raw attempts for 8 files, got ${rawAttempts}`);
+});
+
 test("disabled state short-circuits rounds without network (test escape hatch)", async () => {
     installGithubRouter();
     _setBlogRefreshDisabledForTest(true);
