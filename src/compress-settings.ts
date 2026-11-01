@@ -430,6 +430,12 @@ export function resolveRequestConfig(
 ): ResolvedKernelConfig {
     const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
     const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
-    if (!hasCompressSettings(compress) && limit === base.modelContextLimit) return base;
+    // #5470 default-on: the fold-point switch resolves ON even when no
+    // compress settings are configured at all — and env=off must stay able to
+    // disable that default — so the "nothing configured" short-circuit also
+    // requires both fold-point knobs to resolve falsy.
+    const cafAt = resolveCompressAtFoldPoint(process.env, compress.compressAtFoldPoint);
+    const cafCt = resolveCompressAtFoldPointClearThinking(process.env, compress.compressAtFoldPointClearThinking);
+    if (!hasCompressSettings(compress) && limit === base.modelContextLimit && !cafAt && !cafCt) return base;
     return applyCompressSettings(base, limit, compress, namedProviders ?? {});
 }

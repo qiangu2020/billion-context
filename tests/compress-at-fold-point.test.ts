@@ -1,12 +1,13 @@
 // Experimental fold-point carrier relocation (switch A + switch B): host-side
-// coverage for the two knobs (env > file > OFF), config parsing, settings
-// mapping into the kernel Config, and the signed/strict-echo drop-predicate
+// coverage for the two knobs (env > file > ON-by-default), config parsing,
+// settings mapping into the kernel Config (incl. the resolveRequestConfig
+// short-circuit gate), and the signed/strict-echo drop-predicate
 // doctrine (#1658/#684). Kernel pipeline behavior is covered by
 // kernel/tests/relocate-compress.test.ts.
 import test from "node:test";
 import assert from "node:assert/strict";
 import { defaultConfig, type CoreMessage } from "acp-kernel";
-import { applyCompressSettings } from "../src/compress-settings.ts";
+import { applyCompressSettings, resolveRequestConfig } from "../src/compress-settings.ts";
 import { parseCompressSettings } from "../src/config.ts";
 import { resolveCompressAtFoldPoint, resolveCompressAtFoldPointClearThinking } from "../src/knobs.ts";
 import { makeFoldPointReasoningDroppable } from "../src/server.ts";
@@ -23,15 +24,17 @@ function withEnv(key: string, value: string | undefined, fn: () => void): void {
     }
 }
 
-test("resolveCompressAtFoldPoint: env tier wins, garbage falls through, default off", () => {
+test("resolveCompressAtFoldPoint: env tier wins, garbage falls through, default on", () => {
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "1" } as NodeJS.ProcessEnv), true);
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "ON" } as NodeJS.ProcessEnv), true);
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: " 0 " } as NodeJS.ProcessEnv, true), false, "env 0 beats file true");
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "bogus" } as NodeJS.ProcessEnv, true), true, "garbage env falls to file");
     assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "" } as NodeJS.ProcessEnv, false), false);
-    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv), false, "default off");
+    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv), true, "default on (#5470 promoted)");
+    assert.equal(resolveCompressAtFoldPoint({ BILI_COMPRESS_AT_FOLD_POINT: "off" } as NodeJS.ProcessEnv), false, "explicit env off disables the default");
     assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv, true), true, "file bool honored");
-    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv, "yes"), false, "non-bool file ignored");
+    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv, false), false, "file false honored");
+    assert.equal(resolveCompressAtFoldPoint({} as NodeJS.ProcessEnv, "yes"), true, "non-bool file falls to default on");
 });
 
 test("resolveCompressAtFoldPointClearThinking: same tiers, default off", () => {
@@ -58,9 +61,9 @@ test("applyCompressSettings: maps file flags and lets env override", () => {
             const on = applyCompressSettings(base, 200000, { compressAtFoldPoint: true, compressAtFoldPointClearThinking: true });
             assert.equal(on.compressAtFoldPoint, true);
             assert.equal(on.compressAtFoldPointClearThinking, true);
-            const off = applyCompressSettings(base, 200000, {});
-            assert.equal(off.compressAtFoldPoint, false, "unset file flag resolves off (explicit pass-through)");
-            assert.equal(off.compressAtFoldPointClearThinking, false);
+            const unset = applyCompressSettings(base, 200000, {});
+            assert.equal(unset.compressAtFoldPoint, true, "unset file flag resolves to default on (explicit pass-through)");
+            assert.equal(unset.compressAtFoldPointClearThinking, false, "clear-thinking stays opt-in");
         });
     });
     withEnv("BILI_COMPRESS_AT_FOLD_POINT", "0", () => {
@@ -70,6 +73,30 @@ test("applyCompressSettings: maps file flags and lets env override", () => {
     withEnv("BILI_COMPRESS_AT_FOLD_POINT", "1", () => {
         const out = applyCompressSettings(base, 200000, { compressAtFoldPoint: false });
         assert.equal(out.compressAtFoldPoint, true, "env 1 beats file false");
+    });
+});
+
+test("resolveRequestConfig: runs the mapping so the fold-point defaults reach lanes with zero compress settings", () => {
+    const base = defaultConfig(200000);
+    const model = "model-x";
+    withEnv("BILI_COMPRESS_AT_FOLD_POINT", undefined, () => {
+        withEnv("BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING", undefined, () => {
+            const resolved = resolveRequestConfig(base, {}, undefined, model, 200000);
+            assert.notEqual(resolved, base, "no settings, but the ON default must still be stamped");
+            assert.equal(resolved.compressAtFoldPoint, true);
+            assert.equal(resolved.compressAtFoldPointClearThinking, false);
+        });
+    });
+    // explicit env-off restores the old short-circuit: same object reference
+    withEnv("BILI_COMPRESS_AT_FOLD_POINT", "off", () => {
+        const resolved = resolveRequestConfig(base, {}, undefined, model, 200000);
+        assert.equal(resolved, base, "all-falsy knobs keep returning base untouched");
+    });
+    // switch-B alone must also force the mapping to run
+    withEnv("BILI_COMPRESS_AT_FOLD_POINT_CLEAR_THINKING", "on", () => {
+        const resolved = resolveRequestConfig(base, {}, undefined, model, 200000);
+        assert.notEqual(resolved, base);
+        assert.equal(resolved.compressAtFoldPointClearThinking, true);
     });
 });
 
