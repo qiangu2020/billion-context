@@ -265,8 +265,12 @@ function isSafeRelPath(p: string): boolean {
     return p.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
 }
 
+function encRelPath(rel: string): string {
+    return rel.split("/").map(encodeURIComponent).join("/");
+}
+
 function rawUrl(rel: string): string {
-    return `${GITHUB_RAW_BASE}/${BRANCH}/${rel.split("/").map(encodeURIComponent).join("/")}`;
+    return `${GITHUB_RAW_BASE}/${BRANCH}/${encRelPath(rel)}`;
 }
 
 type SourceName = "raw" | "github-api";
@@ -285,7 +289,7 @@ interface ChainState { start: number; used: Set<SourceName> }
  *  every legal text document below that. First-party hosts only (see module
  *  header): a third-party mirror deliberately does not join the chain. */
 function sourceChainFor(rel: string): { name: SourceName; url: string }[] {
-    const enc = rel.split("/").map(encodeURIComponent).join("/");
+    const enc = encRelPath(rel);
     return [
         { name: "raw", url: rawUrl(rel) },
         { name: "github-api", url: `${GITHUB_CONTENTS_URL}/${enc}?ref=${BRANCH}` },
@@ -328,7 +332,7 @@ async function fetchPlainText(url: string, account?: (bytes: number) => void): P
  *  carries the body base64-inline. Throws on every failure class (incl.
  *  the >1 MiB body omission, which surfaces as `content: null`). */
 async function fetchApiText(rel: string, account?: (bytes: number) => void): Promise<string> {
-    const url = `${GITHUB_CONTENTS_URL}/${rel.split("/").map(encodeURIComponent).join("/")}?ref=${BRANCH}`;
+    const url = `${GITHUB_CONTENTS_URL}/${encRelPath(rel)}?ref=${BRANCH}`;
     const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
     try {
         if (!result.response.ok) throw new Error(`contents GET ${url} → HTTP ${result.response.status}`);
@@ -405,7 +409,7 @@ async function fetchApiImage(rel: string, account?: (bytes: number) => void): Pr
     const ext = rel.slice(rel.lastIndexOf("."));
     const type = ASSET_TYPES[ext.toLowerCase()];
     if (type === undefined) return undefined;
-    const url = `${GITHUB_CONTENTS_URL}/${rel.split("/").map(encodeURIComponent).join("/")}?ref=${BRANCH}`;
+    const url = `${GITHUB_CONTENTS_URL}/${encRelPath(rel)}?ref=${BRANCH}`;
     const result = await fetchWithTimeout(url, ghHeaders("application/json"), FETCH_TIMEOUT_MS);
     try {
         if (result.response.status === 404) return undefined;
